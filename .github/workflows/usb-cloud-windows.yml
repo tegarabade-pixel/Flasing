@@ -20,7 +20,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Validate required secrets
-        shell: powershell
+        shell: pwsh
         env:
           TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
         run: |
@@ -40,30 +40,35 @@ jobs:
           version: latest
           timeout: 3m
           retry: 3
-          log-mode: normal
 
       - name: Verify Tailscale
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          Write-Host "=== tailscale status ==="
           tailscale status
+
           $ip = (tailscale ip -4 | Select-Object -First 1).Trim()
           if ([string]::IsNullOrWhiteSpace($ip)) {
             throw "Tailscale has no IPv4 address."
           }
+
           Write-Host "TAILSCALE_IP=$ip"
-          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
 
       - name: Start USB cloud
-        shell: powershell
+        shell: pwsh
         run: |
-          .\scripts\start-usb-cloud.ps1 -ApiSecret "$env:USB_API_SECRET"
+          .\scripts\start-usb-cloud.ps1 `
+            -ApiSecret "$env:USB_API_SECRET" `
+            -ApiListen "$env:TAILSCALE_IP"
 
       - name: Show connection information
-        shell: powershell
+        shell: pwsh
         run: |
+          Write-Host ""
           Write-Host "======================================="
-          Write-Host " Universal USB Cloud PoC"
+          Write-Host " Universal USB Cloud PoC v0.1.2"
           Write-Host "======================================="
           Write-Host "Runner Tailscale IP : $env:TAILSCALE_IP"
           Write-Host "SFA Remote Control  : http://$env:TAILSCALE_IP`:9090"
@@ -71,21 +76,28 @@ jobs:
           Write-Host "======================================="
 
       - name: Keep runner alive and print diagnostics
-        shell: powershell
+        shell: pwsh
         env:
           KEEP: ${{ inputs.keep_alive_minutes }}
         run: |
           $minutes = [int]$env:KEEP
           $end = (Get-Date).AddMinutes($minutes)
+
           while ((Get-Date) -lt $end) {
             Write-Host "`n=== $(Get-Date -Format o) ==="
+
             Write-Host "`n--- Tailscale ---"
             tailscale status
+
             Write-Host "`n--- USB diagnostics ---"
             .\scripts\diagnose-usb.ps1
+
             Write-Host "`n--- sing-box stdout ---"
-            Get-Content "$env:RUNNER_TEMP\usb-cloud\sing-box.out.log" -Tail 80 -ErrorAction SilentlyContinue
+            Get-Content "$env:RUNNER_TEMP\usb-cloud\sing-box.out.log" -Tail 100 -ErrorAction SilentlyContinue
+
             Write-Host "`n--- sing-box stderr ---"
-            Get-Content "$env:RUNNER_TEMP\usb-cloud\sing-box.err.log" -Tail 80 -ErrorAction SilentlyContinue
+            Get-Content "$env:RUNNER_TEMP\usb-cloud\sing-box.err.log" -Tail 100 -ErrorAction SilentlyContinue
+
             Start-Sleep -Seconds 60
           }
+          
