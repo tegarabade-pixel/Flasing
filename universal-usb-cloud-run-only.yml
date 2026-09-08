@@ -1,0 +1,400 @@
+name: Universal USB Cloud - RUN ONLY
+
+on:
+  workflow_dispatch:
+    inputs:
+      room_code:
+        description: "Room dari APK (copy persis)"
+        required: true
+        type: string
+      keep_alive_minutes:
+        description: "Windows cloud hidup berapa menit"
+        required: true
+        default: "120"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  windows-cloud:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      SIGNAL_URL: wss://universal-usb-signal.reiseakari.workers.dev/ws
+      ROOM: ${{ inputs.room_code }}
+      KEEP: ${{ inputs.keep_alive_minutes }}
+
+    steps:
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+
+      - name: Check Cloudflare signaling
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:ROOM) -or $env:ROOM.Length -lt 12) {
+            throw "Room harus minimal 12 karakter."
+          }
+
+          $health = "https://universal-usb-signal.reiseakari.workers.dev/health"
+          Write-Host "Checking $health"
+
+          $r = Invoke-RestMethod -Uri $health -Method Get -TimeoutSec 20
+          if (-not $r.ok) {
+            throw "Cloudflare signaling health check gagal."
+          }
+
+          Write-Host "Cloudflare signaling: OK"
+          Write-Host "Signal URL: $env:SIGNAL_URL"
+          Write-Host "Room loaded: OK"
+
+      - name: Build Windows Agent
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = Join-Path $env:RUNNER_TEMP "usb-cloud-agent"
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+
+          @'
+          module universal-usb-cloud/agent
+
+          go 1.23
+
+          require (
+              github.com/gorilla/websocket v1.5.3
+              github.com/pion/webrtc/v4 v4.2.18
+          )
+          '@ | Set-Content -Path (Join-Path $root "go.mod") -Encoding utf8
+
+          @'
+          package main
+
+          import (
+              "encoding/json"
+              "flag"
+              "fmt"
+              "log"
+              "net/url"
+              "os"
+              "os/signal"
+              "strings"
+              "sync"
+              "syscall"
+              "time"
+
+              "github.com/gorilla/websocket"
+              "github.com/pion/webrtc/v4"
+          )
+
+          type Signal struct {
+              Type          string  `json:"type"`
+              SDP           string  `json:"sdp,omitempty"`
+              Candidate     string  `json:"candidate,omitempty"`
+              SDPMid        *string `json:"sdpMid,omitempty"`
+              SDPMLineIndex *uint16 `json:"sdpMLineIndex,omitempty"`
+          }
+
+          type SafeWS struct {
+              c  *websocket.Conn
+              mu sync.Mutex
+          }
+
+          func (s *SafeWS) send(v any) error {
+              s.mu.Lock()
+              defer s.mu.Unlock()
+              return s.c.WriteJSON(v)
+          }
+
+          func makeSignalURL(base, room string) (string, error) {
+              u, err := url.Parse(base)
+              if err != nil {
+                  return "", err
+              }
+
+              switch u.Scheme {
+              case "https":
+                  u.Scheme = "wss"
+              case "http":
+                  u.Scheme = "ws"
+              case "ws", "wss":
+              default:
+                  return "", fmt.Errorf("signal URL harus ws/wss/http/https")
+              }
+
+              if u.Path == "" || u.Path == "/" {
+                  u.Path = "/ws"
+              }
+
+              q := u.Query()
+              q.Set("room", room)
+              q.Set("role", "windows")
+              u.RawQuery = q.Encode()
+              return u.String(), nil
+          }
+
+          func main() {
+              signalBase := flag.String("signal", "", "signaling URL")
+              room := flag.String("room", "", "room code")
+              flag.Parse()
+
+              if *signalBase == "" || len(*room) < 12 {
+                  flag.Usage()
+                  os.Exit(2)
+              }
+
+              wsURL, err := makeSignalURL(*signalBase, *room)
+              if err != nil {
+                  log.Fatal(err)
+              }
+
+              log.Printf("Signaling: %s", wsURL)
+
+              rawWS, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+              if err != nil {
+                  log.Fatalf("signaling connect: %v", err)
+              }
+              defer rawWS.Close()
+
+              ws := &SafeWS{c: rawWS}
+
+              pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+                  ICEServers: []webrtc.ICEServer{
+                      {URLs: []string{"stun:stun.cloudflare.com:3478"}},
+                  },
+              })
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer pc.Close()
+
+              var remoteSet bool
+              var pending []webrtc.ICECandidateInit
+              var pendingMu sync.Mutex
+
+              pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+                  log.Printf("ICE: %s", state.String())
+              })
+
+              pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+                  log.Printf("PeerConnection: %s", state.String())
+              })
+
+              pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+                  if c == nil {
+                      return
+                  }
+
+                  init := c.ToJSON()
+                  _ = ws.send(Signal{
+                      Type:          "candidate",
+                      Candidate:     init.Candidate,
+                      SDPMid:        init.SDPMid,
+                      SDPMLineIndex: init.SDPMLineIndex,
+                  })
+              })
+
+              pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+                  log.Printf("DataChannel announced: %q", dc.Label())
+
+                  dc.OnOpen(func() {
+                      log.Printf("DataChannel %q OPEN", dc.Label())
+
+                      hello, _ := json.Marshal(map[string]any{
+                          "type": "windows-ready",
+                          "time": time.Now().UTC().Format(time.RFC3339Nano),
+                      })
+                      _ = dc.SendText(string(hello))
+                  })
+
+                  dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+                      if !msg.IsString {
+                          log.Printf("binary frame: %d bytes", len(msg.Data))
+                          return
+                      }
+
+                      var obj map[string]any
+                      if err := json.Unmarshal(msg.Data, &obj); err != nil {
+                          log.Printf("text: %s", string(msg.Data))
+                          return
+                      }
+
+                      if obj["type"] == "usb-device" {
+                          pretty, _ := json.MarshalIndent(obj, "", "  ")
+                          log.Printf("USB DEVICE FROM ANDROID:\n%s", pretty)
+                          return
+                      }
+
+                      log.Printf("message: %s", string(msg.Data))
+                  })
+              })
+
+              go func() {
+                  for {
+                      _, raw, err := rawWS.ReadMessage()
+                      if err != nil {
+                          log.Printf("signaling read ended: %v", err)
+                          return
+                      }
+
+                      var generic map[string]any
+                      if json.Unmarshal(raw, &generic) == nil {
+                          t, _ := generic["type"].(string)
+                          if t == "signal-ready" || t == "peer-joined" || t == "peer-left" {
+                              log.Printf("signal event: %s", strings.TrimSpace(string(raw)))
+                              continue
+                          }
+                      }
+
+                      var sig Signal
+                      if err := json.Unmarshal(raw, &sig); err != nil {
+                          log.Printf("bad signal: %v", err)
+                          continue
+                      }
+
+                      switch sig.Type {
+                      case "offer":
+                          log.Printf("received offer")
+
+                          if err := pc.SetRemoteDescription(webrtc.SessionDescription{
+                              Type: webrtc.SDPTypeOffer,
+                              SDP:  sig.SDP,
+                          }); err != nil {
+                              log.Printf("SetRemoteDescription: %v", err)
+                              continue
+                          }
+
+                          pendingMu.Lock()
+                          remoteSet = true
+                          for _, c := range pending {
+                              if err := pc.AddICECandidate(c); err != nil {
+                                  log.Printf("add buffered candidate: %v", err)
+                              }
+                          }
+                          pending = nil
+                          pendingMu.Unlock()
+
+                          answer, err := pc.CreateAnswer(nil)
+                          if err != nil {
+                              log.Printf("CreateAnswer: %v", err)
+                              continue
+                          }
+
+                          if err := pc.SetLocalDescription(answer); err != nil {
+                              log.Printf("SetLocalDescription: %v", err)
+                              continue
+                          }
+
+                          if err := ws.send(Signal{Type: "answer", SDP: answer.SDP}); err != nil {
+                              log.Printf("send answer: %v", err)
+                          }
+
+                      case "candidate":
+                          init := webrtc.ICECandidateInit{
+                              Candidate:     sig.Candidate,
+                              SDPMid:        sig.SDPMid,
+                              SDPMLineIndex: sig.SDPMLineIndex,
+                          }
+
+                          pendingMu.Lock()
+                          if !remoteSet {
+                              pending = append(pending, init)
+                              pendingMu.Unlock()
+                              continue
+                          }
+                          pendingMu.Unlock()
+
+                          if err := pc.AddICECandidate(init); err != nil {
+                              log.Printf("AddICECandidate: %v", err)
+                          }
+                      }
+                  }
+              }()
+
+              log.Println("Windows agent ready; waiting Android offer.")
+
+              stop := make(chan os.Signal, 1)
+              signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+              <-stop
+          }
+          '@ | Set-Content -Path (Join-Path $root "main.go") -Encoding utf8
+
+          Push-Location $root
+          go mod tidy
+          go build -trimpath -ldflags="-s -w" -o usb-cloud-agent.exe .
+          Pop-Location
+
+          $exe = Join-Path $root "usb-cloud-agent.exe"
+          if (-not (Test-Path $exe)) {
+            throw "Build Windows Agent gagal."
+          }
+
+          "AGENT_EXE=$exe" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          Write-Host "Windows Agent build: OK"
+
+      - name: Start Windows P2P Agent
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $out = Join-Path $env:RUNNER_TEMP "usb-agent.out.log"
+          $err = Join-Path $env:RUNNER_TEMP "usb-agent.err.log"
+
+          Write-Host "========================================"
+          Write-Host " WINDOWS CLOUD READY"
+          Write-Host " Signal : $env:SIGNAL_URL"
+          Write-Host " Room   : [input room]"
+          Write-Host " Di APK:"
+          Write-Host " 1. Signal URL harus sama"
+          Write-Host " 2. Room harus sama persis"
+          Write-Host " 3. Tekan CONNECT P2P"
+          Write-Host "========================================"
+
+          $agentArgs = @(
+            "-signal", $env:SIGNAL_URL,
+            "-room", $env:ROOM
+          )
+
+          $proc = Start-Process `
+            -FilePath $env:AGENT_EXE `
+            -ArgumentList $agentArgs `
+            -RedirectStandardOutput $out `
+            -RedirectStandardError $err `
+            -PassThru
+
+          Start-Sleep 4
+
+          if ($proc.HasExited) {
+            Write-Host "--- STDOUT ---"
+            Get-Content $out -ErrorAction SilentlyContinue
+            Write-Host "--- STDERR ---"
+            Get-Content $err -ErrorAction SilentlyContinue
+            throw "Windows Agent langsung berhenti, exit code $($proc.ExitCode)"
+          }
+
+          Write-Host "Windows Agent PID: $($proc.Id)"
+          Write-Host "Agent sedang menunggu APK..."
+
+          $end = (Get-Date).AddMinutes([int]$env:KEEP)
+
+          while ((Get-Date) -lt $end) {
+            if ($proc.HasExited) {
+              Write-Host "--- STDOUT ---"
+              Get-Content $out -Tail 200 -ErrorAction SilentlyContinue
+              Write-Host "--- STDERR ---"
+              Get-Content $err -Tail 200 -ErrorAction SilentlyContinue
+              throw "Windows Agent berhenti, exit code $($proc.ExitCode)"
+            }
+
+            Write-Host ""
+            Write-Host "=== $(Get-Date -Format o) ==="
+            Get-Content $out -Tail 100 -ErrorAction SilentlyContinue
+            Get-Content $err -Tail 100 -ErrorAction SilentlyContinue
+            Start-Sleep 15
+          }
+
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
