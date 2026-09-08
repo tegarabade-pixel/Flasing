@@ -1,0 +1,91 @@
+name: Universal USB Cloud PoC
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_alive_minutes:
+        description: "How long to keep the PoC runner alive"
+        required: true
+        default: "120"
+
+jobs:
+  usb-cloud:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      USB_API_SECRET: ${{ secrets.USB_API_SECRET }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        shell: powershell
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Missing GitHub secret: TS_AUTHKEY"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:USB_API_SECRET)) {
+            throw "Missing GitHub secret: USB_API_SECRET"
+          }
+          Write-Host "Required secrets are present."
+
+      - name: Connect runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: usb-cloud-${{ github.run_id }}
+          version: latest
+          timeout: 3m
+          retry: 3
+          log-mode: normal
+
+      - name: Verify Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          tailscale status
+          $ip = (tailscale ip -4 | Select-Object -First 1).Trim()
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+            throw "Tailscale has no IPv4 address."
+          }
+          Write-Host "TAILSCALE_IP=$ip"
+          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Start USB cloud
+        shell: powershell
+        run: |
+          .\scripts\start-usb-cloud.ps1 -ApiSecret "$env:USB_API_SECRET"
+
+      - name: Show connection information
+        shell: powershell
+        run: |
+          Write-Host "======================================="
+          Write-Host " Universal USB Cloud PoC"
+          Write-Host "======================================="
+          Write-Host "Runner Tailscale IP : $env:TAILSCALE_IP"
+          Write-Host "SFA Remote Control  : http://$env:TAILSCALE_IP`:9090"
+          Write-Host "USB/IP local server : 127.0.0.1:3240"
+          Write-Host "======================================="
+
+      - name: Keep runner alive and print diagnostics
+        shell: powershell
+        env:
+          KEEP: ${{ inputs.keep_alive_minutes }}
+        run: |
+          $minutes = [int]$env:KEEP
+          $end = (Get-Date).AddMinutes($minutes)
+          while ((Get-Date) -lt $end) {
+            Write-Host "`n=== $(Get-Date -Format o) ==="
+            Write-Host "`n--- Tailscale ---"
+            tailscale status
+            Write-Host "`n--- USB diagnostics ---"
+            .\scripts\diagnose-usb.ps1
+            Write-Host "`n--- sing-box stdout ---"
+            Get-Content "$env:RUNNER_TEMP\usb-cloud\sing-box.out.log" -Tail 80 -ErrorAction SilentlyContinue
+            Write-Host "`n--- sing-box stderr ---"
+            Get-Content "$env:RUNNER_TEMP\usb-cloud\sing-box.err.log" -Tail 80 -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 60
+          }
