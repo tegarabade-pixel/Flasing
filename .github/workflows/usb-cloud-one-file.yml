@@ -133,7 +133,7 @@ jobs:
                 tag = "api"
                 listen = "127.0.0.1"
                 listen_port = 9090
-                secret = $env:USB_API_SECRET
+                secret = ""
               },
 
               @{
