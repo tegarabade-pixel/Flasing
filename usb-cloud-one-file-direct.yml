@@ -1,0 +1,194 @@
+name: Universal USB Cloud - Direct USBIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_tailscale_ip:
+        description: "IP Tailscale HP HOST Android (100.x.x.x)"
+        required: true
+      keep_alive_minutes:
+        description: "Runner hidup berapa menit"
+        required: true
+        default: "120"
+
+jobs:
+  usb-cloud:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Validate input
+        shell: pwsh
+        run: |
+          $ip = '${{ inputs.android_tailscale_ip }}'.Trim()
+          if ($ip -notmatch '^100\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
+            throw "Isi android_tailscale_ip dengan IP Tailscale HP host, contoh 100.118.152.23"
+          }
+          "ANDROID_TS_IP=$ip" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+
+      - name: Connect runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: usb-cloud-${{ github.run_id }}
+          version: latest
+          timeout: 3m
+          retry: 3
+
+      - name: Install latest usbip-win2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          Write-Host "Fetching latest usbip-win2 release..."
+          $headers = @{ "User-Agent" = "Universal-USB-Cloud" }
+          $release = Invoke-RestMethod `
+            -Headers $headers `
+            -Uri "https://api.github.com/repos/vadimgrn/usbip-win2/releases/latest"
+
+          Write-Host "Latest release: $($release.tag_name)"
+
+          $asset = $release.assets |
+            Where-Object {
+              $_.name -match '^USBip-.*-x64\.exe$'
+            } |
+            Select-Object -First 1
+
+          if (-not $asset) {
+            Write-Host "Available assets:"
+            $release.assets | ForEach-Object { Write-Host " - $($_.name)" }
+            throw "Installer x64 usbip-win2 tidak ditemukan di release terbaru."
+          }
+
+          $installer = Join-Path $env:RUNNER_TEMP $asset.name
+          Write-Host "Downloading $($asset.name)..."
+          Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $installer
+
+          Write-Host "Installing usbip-win2..."
+          $p = Start-Process `
+            -FilePath $installer `
+            -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-" `
+            -PassThru -Wait
+
+          Write-Host "Installer exit code: $($p.ExitCode)"
+          if ($p.ExitCode -notin @(0,3010)) {
+            throw "usbip-win2 installer gagal, exit code $($p.ExitCode)"
+          }
+
+          $usbip = "C:\Program Files\USBip\usbip.exe"
+          if (-not (Test-Path $usbip)) {
+            $found = Get-ChildItem "C:\Program Files" -Filter usbip.exe -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if ($found) { $usbip = $found.FullName }
+          }
+
+          if (-not (Test-Path $usbip)) {
+            throw "usbip.exe tidak ditemukan setelah instalasi."
+          }
+
+          "USBIP_EXE=$usbip" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          Write-Host "usbip.exe: $usbip"
+
+          Write-Host "`nUSB/IP driver/services:"
+          Get-Service -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'usbip' -or $_.DisplayName -match 'USB/IP|USBip' } |
+            Format-Table -AutoSize
+
+      - name: Wait for Android USB-IP server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "========================================"
+          Write-Host "ANDROID HOST: $env:ANDROID_TS_IP"
+          Write-Host "Waiting TCP 3240..."
+          Write-Host "Di HP: buka Android-Usbipdcpp,"
+          Write-Host "set port 3240, Start Server, colok OTG,"
+          Write-Host "grant permission, lalu Bind device."
+          Write-Host "========================================"
+
+          $deadline = (Get-Date).AddMinutes(10)
+
+          while ((Get-Date) -lt $deadline) {
+            $ok = Test-NetConnection `
+              $env:ANDROID_TS_IP `
+              -Port 3240 `
+              -InformationLevel Quiet `
+              -WarningAction SilentlyContinue
+
+            if ($ok) {
+              Write-Host "Android USB/IP server reachable: OK"
+              exit 0
+            }
+
+            Write-Host "Belum reachable... $(Get-Date -Format T)"
+            Start-Sleep 5
+          }
+
+          throw "Android USB/IP server $env:ANDROID_TS_IP`:3240 tidak reachable selama 10 menit."
+
+      - name: Verify USB-IP device list
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "Remote USB devices:"
+          & "$env:USBIP_EXE" list -r "$env:ANDROID_TS_IP"
+
+          Write-Host "`nKalau device OTG belum muncul, bind device di Android-Usbipdcpp."
+
+      - name: Auto attach USB devices and keep runner alive
+        shell: pwsh
+        env:
+          KEEP: ${{ inputs.keep_alive_minutes }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $end = (Get-Date).AddMinutes([int]$env:KEEP)
+          $lastPnp = ""
+
+          Write-Host "========================================"
+          Write-Host "AUTO USB ATTACH ACTIVE"
+          Write-Host "Android: $env:ANDROID_TS_IP`:3240"
+          Write-Host "========================================"
+
+          while ((Get-Date) -lt $end) {
+
+            # Get standard USB/IP export list.
+            $output = (& "$env:USBIP_EXE" list -r "$env:ANDROID_TS_IP" 2>&1 | Out-String)
+
+            # Standard bus IDs look like 1-1, 2-3.4, etc.
+            $busIds = [regex]::Matches(
+              $output,
+              '(?m)^\s*([0-9]+-[0-9]+(?:\.[0-9]+)*):'
+            ) | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+
+            foreach ($bus in $busIds) {
+              Write-Host "Trying attach busid $bus ..."
+              $attach = (& "$env:USBIP_EXE" attach -r "$env:ANDROID_TS_IP" -b "$bus" 2>&1 | Out-String)
+              if ($attach.Trim()) { Write-Host $attach.Trim() }
+            }
+
+            $pnp = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.Class -match "USB|DiskDrive|HIDClass|Ports|AndroidUsbDeviceClass"
+              } |
+              Sort-Object Class,FriendlyName |
+              Select-Object Status,Class,FriendlyName,InstanceId |
+              Format-Table -AutoSize |
+              Out-String
+
+            if ($pnp -ne $lastPnp) {
+              Write-Host "`n=== WINDOWS USB/PnP CHANGED ==="
+              Write-Host $pnp
+              $lastPnp = $pnp
+
+              Write-Host "`n=== DISKS ==="
+              Get-Disk -ErrorAction SilentlyContinue | Format-Table -AutoSize
+
+              Write-Host "`n=== VOLUMES ==="
+              Get-Volume -ErrorAction SilentlyContinue | Format-Table -AutoSize
+            }
+
+            Start-Sleep 3
+          }
