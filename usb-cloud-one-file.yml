@@ -1,0 +1,350 @@
+name: Universal USB Cloud - One File
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_alive_minutes:
+        description: "Runner hidup berapa menit"
+        required: true
+        default: "120"
+
+jobs:
+  usb-cloud:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    env:
+      USB_API_SECRET: ${{ secrets.USB_API_SECRET }}
+
+    steps:
+      - name: Check secrets
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Secret TS_AUTHKEY belum dibuat."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:USB_API_SECRET)) {
+            throw "Secret USB_API_SECRET belum dibuat."
+          }
+
+          Write-Host "Secrets OK"
+
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: usb-cloud-${{ github.run_id }}
+          version: latest
+          timeout: 3m
+          retry: 3
+
+      - name: Start Universal USB Cloud
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          Write-Host "======================================"
+          Write-Host " UNIVERSAL USB CLOUD - ONE FILE"
+          Write-Host "======================================"
+
+          # ------------------------------------------------------------
+          # 1. Tailscale
+          # ------------------------------------------------------------
+
+          Write-Host "`n[1/7] Checking Tailscale..."
+
+          tailscale status
+
+          $tsIp = (tailscale ip -4 | Select-Object -First 1).Trim()
+
+          if ([string]::IsNullOrWhiteSpace($tsIp)) {
+            throw "Tailscale tidak mempunyai IPv4."
+          }
+
+          Write-Host "Tailscale IP: $tsIp"
+
+          "TAILSCALE_IP=$tsIp" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+
+
+          # ------------------------------------------------------------
+          # 2. Download sing-box
+          # ------------------------------------------------------------
+
+          Write-Host "`n[2/7] Downloading sing-box..."
+
+          $Version = "1.14.0"
+          $Work = Join-Path $env:RUNNER_TEMP "usb-cloud"
+
+          if (Test-Path $Work) {
+            Remove-Item $Work -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $Work -Force | Out-Null
+
+          $Zip = Join-Path $Work "sing-box.zip"
+
+          $Url = "https://github.com/SagerNet/sing-box/releases/download/v$Version/sing-box-$Version-windows-amd64.zip"
+
+          Invoke-WebRequest `
+            -UseBasicParsing `
+            -Uri $Url `
+            -OutFile $Zip
+
+          Expand-Archive `
+            -Path $Zip `
+            -DestinationPath $Work `
+            -Force
+
+          $SingBox = Get-ChildItem `
+            -Path $Work `
+            -Filter "sing-box.exe" `
+            -Recurse |
+            Select-Object -First 1
+
+          if (-not $SingBox) {
+            throw "sing-box.exe tidak ditemukan."
+          }
+
+          Write-Host "sing-box: $($SingBox.FullName)"
+
+
+          # ------------------------------------------------------------
+          # 3. Create sing-box config
+          # ------------------------------------------------------------
+
+          Write-Host "`n[3/7] Creating config..."
+
+          $ConfigPath = Join-Path $Work "sing-box.json"
+
+          $Config = @{
+            log = @{
+              level = "debug"
+              timestamp = $true
+            }
+
+            services = @(
+              @{
+                type = "api"
+                tag = "api"
+                listen = "127.0.0.1"
+                listen_port = 9090
+                secret = $env:USB_API_SECRET
+              },
+
+              @{
+                type = "usbip-server"
+                tag = "android-usb"
+                listen = "127.0.0.1"
+                listen_port = 3240
+                provider = "dynamic"
+              },
+
+              @{
+                type = "usbip-client"
+                tag = "windows-usb"
+                server = "127.0.0.1"
+                server_port = 3240
+                devices = @()
+              }
+            )
+          }
+
+          $Json = $Config | ConvertTo-Json -Depth 20
+
+          # Explicit UTF-8 tanpa BOM.
+          $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
+          [System.IO.File]::WriteAllText(
+            $ConfigPath,
+            $Json,
+            $Utf8NoBom
+          )
+
+          # Test JSON.
+          $null = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+
+          Write-Host "JSON: OK"
+
+          & $SingBox.FullName check -c $ConfigPath
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "sing-box config tidak valid."
+          }
+
+          Write-Host "sing-box config: OK"
+
+
+          # ------------------------------------------------------------
+          # 4. Start sing-box
+          # ------------------------------------------------------------
+
+          Write-Host "`n[4/7] Starting USB backend..."
+
+          $Stdout = Join-Path $Work "sing-box.out.log"
+          $Stderr = Join-Path $Work "sing-box.err.log"
+
+          $Proc = Start-Process `
+            -FilePath $SingBox.FullName `
+            -ArgumentList @("run", "-c", $ConfigPath) `
+            -RedirectStandardOutput $Stdout `
+            -RedirectStandardError $Stderr `
+            -PassThru
+
+          Start-Sleep 8
+
+          if ($Proc.HasExited) {
+            Write-Host "--- STDOUT ---"
+            Get-Content $Stdout -Tail 200 -ErrorAction SilentlyContinue
+
+            Write-Host "--- STDERR ---"
+            Get-Content $Stderr -Tail 200 -ErrorAction SilentlyContinue
+
+            throw "sing-box berhenti."
+          }
+
+          Write-Host "sing-box PID: $($Proc.Id)"
+
+
+          # ------------------------------------------------------------
+          # 5. Verify local services
+          # ------------------------------------------------------------
+
+          Write-Host "`n[5/7] Checking local ports..."
+
+          $ApiTest = Test-NetConnection `
+            127.0.0.1 `
+            -Port 9090 `
+            -WarningAction SilentlyContinue
+
+          if (-not $ApiTest.TcpTestSucceeded) {
+            throw "API 127.0.0.1:9090 tidak aktif."
+          }
+
+          $UsbTest = Test-NetConnection `
+            127.0.0.1 `
+            -Port 3240 `
+            -WarningAction SilentlyContinue
+
+          if (-not $UsbTest.TcpTestSucceeded) {
+            throw "USB/IP 127.0.0.1:3240 tidak aktif."
+          }
+
+          Write-Host "API    127.0.0.1:9090 = OK"
+          Write-Host "USB/IP 127.0.0.1:3240 = OK"
+
+
+          # ------------------------------------------------------------
+          # 6. Tailscale TCP forward
+          # ------------------------------------------------------------
+
+          Write-Host "`n[6/7] Creating Tailnet TCP forward..."
+
+          # Hapus konfigurasi Serve lama jika ada.
+          & tailscale serve reset 2>$null
+
+          # HP -> Tailscale IP:9090 -> localhost:9090
+          & tailscale serve `
+            --bg `
+            --tcp=9090 `
+            tcp://127.0.0.1:9090
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Gagal membuat Tailscale TCP forward."
+          }
+
+          Write-Host ""
+          tailscale serve status
+
+
+          # ------------------------------------------------------------
+          # 7. READY
+          # ------------------------------------------------------------
+
+          Write-Host "`n[7/7] READY"
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host " UNIVERSAL USB CLOUD READY"
+          Write-Host "======================================"
+          Write-Host ""
+          Write-Host "Tailscale IP:"
+          Write-Host "  $tsIp"
+          Write-Host ""
+          Write-Host "SFA Remote Control:"
+          Write-Host "  http://$tsIp`:9090"
+          Write-Host ""
+          Write-Host "USB/IP local:"
+          Write-Host "  127.0.0.1:3240"
+          Write-Host ""
+          Write-Host "Di Termux HP tes:"
+          Write-Host "  curl -v --max-time 10 http://$tsIp`:9090/"
+          Write-Host ""
+          Write-Host "======================================"
+
+
+      - name: Keep runner alive
+        shell: pwsh
+        env:
+          KEEP: ${{ inputs.keep_alive_minutes }}
+        run: |
+          $Minutes = [int]$env:KEEP
+          $End = (Get-Date).AddMinutes($Minutes)
+
+          Write-Host "Runner akan hidup $Minutes menit."
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+          while ((Get-Date) -lt $End) {
+
+            Write-Host ""
+            Write-Host "======================================"
+            Write-Host "$(Get-Date -Format o)"
+            Write-Host "======================================"
+
+            Write-Host "`n--- Tailscale ---"
+            tailscale status
+
+            Write-Host "`n--- Tailscale Serve ---"
+            tailscale serve status
+
+            Write-Host "`n--- USB/PnP devices ---"
+
+            Get-PnpDevice -PresentOnly |
+              Where-Object {
+                $_.Class -match "USB|DiskDrive|HIDClass|Ports|AndroidUsbDeviceClass"
+              } |
+              Sort-Object Class,FriendlyName |
+              Format-Table -AutoSize
+
+            Write-Host "`n--- Disks ---"
+            Get-Disk -ErrorAction SilentlyContinue |
+              Format-Table -AutoSize
+
+            Write-Host "`n--- Volumes ---"
+            Get-Volume -ErrorAction SilentlyContinue |
+              Format-Table -AutoSize
+
+            Write-Host "`n--- Ports ---"
+            Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.LocalPort -in 9090,3240
+              } |
+              Format-Table -AutoSize
+
+            Write-Host "`n--- sing-box stdout ---"
+            Get-Content `
+              "$env:RUNNER_TEMP\usb-cloud\sing-box.out.log" `
+              -Tail 100 `
+              -ErrorAction SilentlyContinue
+
+            Write-Host "`n--- sing-box stderr ---"
+            Get-Content `
+              "$env:RUNNER_TEMP\usb-cloud\sing-box.err.log" `
+              -Tail 100 `
+              -ErrorAction SilentlyContinue
+
+            Start-Sleep 60
+          }
