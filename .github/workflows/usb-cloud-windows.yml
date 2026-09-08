@@ -1,0 +1,60 @@
+name: Universal USB Cloud PoC
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_alive_minutes:
+        description: "How long to keep the PoC runner alive"
+        required: true
+        default: "120"
+
+jobs:
+  usb-cloud:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+      USB_API_SECRET: ${{ secrets.USB_API_SECRET }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Tailscale (temporary PoC network)
+        if: ${{ env.TS_AUTHKEY != '' }}
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+          $msi = "$env:RUNNER_TEMP\tailscale.msi"
+          Invoke-WebRequest -UseBasicParsing `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey="$env:TS_AUTHKEY" `
+            --hostname="usb-cloud-${{ github.run_id }}"
+          Write-Host "Runner Tailscale IPv4:"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+
+      - name: Start USB cloud
+        shell: powershell
+        run: |
+          .\scripts\start-usb-cloud.ps1 -ApiSecret "$env:USB_API_SECRET"
+
+      - name: Keep runner alive and print diagnostics
+        shell: powershell
+        env:
+          KEEP: ${{ inputs.keep_alive_minutes }}
+        run: |
+          $minutes = [int]$env:KEEP
+          $end = (Get-Date).AddMinutes($minutes)
+          while ((Get-Date) -lt $end) {
+            Write-Host "`n=== $(Get-Date -Format o) ==="
+            .\scripts\diagnose-usb.ps1
+            Write-Host "`n--- sing-box stdout ---"
+            Get-Content "$env:RUNNER_TEMP\usb-cloud\sing-box.out.log" -Tail 80 -ErrorAction SilentlyContinue
+            Write-Host "`n--- sing-box stderr ---"
+            Get-Content "$env:RUNNER_TEMP\usb-cloud\sing-box.err.log" -Tail 80 -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 60
+          }
