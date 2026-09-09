@@ -1,0 +1,783 @@
+name: Universal USB Cloud - FULL RELAY
+
+on:
+  workflow_dispatch:
+    inputs:
+      room_code:
+        description: "Room yang tampil di APK (copy persis)"
+        required: true
+        type: string
+      keep_alive_minutes:
+        description: "Windows cloud hidup berapa menit"
+        required: true
+        default: "120"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  windows-cloud:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      ROOM: ${{ inputs.room_code }}
+      KEEP: ${{ inputs.keep_alive_minutes }}
+      SIGNAL_URL: wss://universal-usb-signal.reiseakari.workers.dev/ws
+      GH_TOKEN: ${{ github.token }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Deploy FULL relay Worker
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:CLOUDFLARE_API_TOKEN)) { throw "Missing CLOUDFLARE_API_TOKEN" }
+          if ([string]::IsNullOrWhiteSpace($env:CLOUDFLARE_ACCOUNT_ID)) { throw "Missing CLOUDFLARE_ACCOUNT_ID" }
+
+          $r = Join-Path $env:RUNNER_TEMP "uuc-worker"
+          New-Item -ItemType Directory -Path "$r\src" -Force | Out-Null
+
+          @'
+          name = "universal-usb-signal"
+          main = "src/index.js"
+          compatibility_date = "2026-09-01"
+          workers_dev = true
+
+          [[durable_objects.bindings]]
+          name = "ROOMS"
+          class_name = "SignalRoom"
+
+          [[migrations]]
+          tag = "v1"
+          new_sqlite_classes = ["SignalRoom"]
+          '@ | Set-Content "$r\wrangler.toml" -Encoding utf8
+
+          @'
+          import { DurableObject } from "cloudflare:workers";
+
+          function validRoom(room) {
+            return typeof room === "string" &&
+              /^[A-Za-z0-9_-]{12,80}$/.test(room);
+          }
+
+          export default {
+            async fetch(request, env) {
+              const u = new URL(request.url);
+
+              if (u.pathname === "/health") {
+                return Response.json({
+                  ok: true,
+                  service: "universal-usb-relay",
+                  protocol: 2
+                });
+              }
+
+              if (u.pathname !== "/ws") {
+                return new Response("Universal USB Cloud relay", {status: 200});
+              }
+
+              if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+                return new Response("WebSocket required", {status: 426});
+              }
+
+              const room = u.searchParams.get("room");
+              const role = u.searchParams.get("role");
+
+              if (!validRoom(room)) return new Response("Invalid room", {status: 400});
+              if (role !== "android" && role !== "windows")
+                return new Response("Invalid role", {status: 400});
+
+              const id = env.ROOMS.idFromName(room);
+              const stub = env.ROOMS.get(id);
+              const forwarded = new Request(request);
+              forwarded.headers.set("X-UUC-Role", role);
+              return stub.fetch(forwarded);
+            }
+          };
+
+          export class SignalRoom extends DurableObject {
+            constructor(ctx, env) {
+              super(ctx, env);
+              this.ctx = ctx;
+            }
+
+            async fetch(request) {
+              const role = request.headers.get("X-UUC-Role");
+              const pair = new WebSocketPair();
+              const client = pair[0];
+              const server = pair[1];
+
+              for (const old of this.ctx.getWebSockets()) {
+                if (old.deserializeAttachment()?.role === role) {
+                  try { old.close(4001, "replaced"); } catch {}
+                }
+              }
+
+              server.serializeAttachment({role});
+              this.ctx.acceptWebSocket(server);
+
+              server.send(JSON.stringify({
+                type: "signal-ready",
+                role,
+                peers: this.ctx.getWebSockets().length
+              }));
+
+              for (const ws of this.ctx.getWebSockets()) {
+                if (ws !== server && ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({type: "peer-joined", role}));
+                }
+              }
+
+              return new Response(null, {status: 101, webSocket: client});
+            }
+
+            async webSocketMessage(ws, message) {
+              const size = typeof message === "string"
+                ? new TextEncoder().encode(message).length
+                : message.byteLength;
+
+              if (size > 8 * 1024 * 1024) {
+                ws.close(1009, "frame exceeds 8 MiB");
+                return;
+              }
+
+              const sender = ws.deserializeAttachment()?.role ?? "unknown";
+
+              for (const peer of this.ctx.getWebSockets()) {
+                if (peer === ws || peer.readyState !== WebSocket.OPEN) continue;
+                if (peer.deserializeAttachment()?.role === sender) continue;
+                peer.send(message);
+              }
+            }
+
+            async webSocketClose(ws) {
+              const role = ws.deserializeAttachment()?.role ?? "unknown";
+              for (const peer of this.ctx.getWebSockets()) {
+                if (peer !== ws && peer.readyState === WebSocket.OPEN) {
+                  peer.send(JSON.stringify({type: "peer-left", role}));
+                }
+              }
+            }
+          }
+          '@ | Set-Content "$r\src\index.js" -Encoding utf8
+
+          Push-Location $r
+          npx --yes wrangler@4 deploy
+          Pop-Location
+
+          $h = Invoke-RestMethod -Uri "https://universal-usb-signal.reiseakari.workers.dev/health" -TimeoutSec 20
+          if (-not $h.ok) { throw "Relay health check gagal" }
+          Write-Host "Cloudflare relay: OK"
+
+      - name: Install latest usbip-win2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          $headers = @{
+            "Accept" = "application/vnd.github+json"
+            "Authorization" = "Bearer $env:GH_TOKEN"
+            "X-GitHub-Api-Version" = "2022-11-28"
+            "User-Agent" = "Universal-USB-Cloud"
+          }
+
+          $release = Invoke-RestMethod -Headers $headers `
+            -Uri "https://api.github.com/repos/vadimgrn/usbip-win2/releases/latest"
+
+          $asset = $release.assets |
+            Where-Object { $_.name -match '(?i)-x64\.exe$' } |
+            Select-Object -First 1
+
+          if (-not $asset) { throw "usbip-win2 x64 installer tidak ditemukan" }
+
+          $installer = Join-Path $env:RUNNER_TEMP $asset.name
+          Invoke-WebRequest -UseBasicParsing `
+            -Headers @{"Authorization"="Bearer $env:GH_TOKEN";"User-Agent"="Universal-USB-Cloud"} `
+            -Uri $asset.browser_download_url -OutFile $installer
+
+          $p = Start-Process -FilePath $installer `
+            -ArgumentList @("/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-") `
+            -PassThru
+
+          $deadline = (Get-Date).AddSeconds(120)
+          while (-not $p.HasExited -and (Get-Date) -lt $deadline) {
+            Start-Sleep 2
+            $p.Refresh()
+          }
+
+          $usbip = @(
+            "C:\Program Files\USBip\usbip.exe",
+            "C:\Program Files (x86)\USBip\usbip.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $usbip) {
+            $f = Get-ChildItem "C:\Program Files" -Filter usbip.exe -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if ($f) { $usbip = $f.FullName }
+          }
+
+          if (-not $usbip) { throw "usbip.exe tidak ditemukan setelah install" }
+          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+
+          "USBIP_EXE=$usbip" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          Write-Host "usbip-win2: $usbip"
+
+      - name: Build Windows relay + USB-IP agent
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $r = Join-Path $env:RUNNER_TEMP "uuc-agent"
+          New-Item -ItemType Directory -Path $r -Force | Out-Null
+
+          @'
+          module universal-usb-cloud/agent
+          go 1.23
+          require github.com/gorilla/websocket v1.5.3
+          '@ | Set-Content "$r\go.mod" -Encoding utf8
+
+          @'
+          package main
+
+          import (
+              "bytes"
+              "encoding/binary"
+              "encoding/json"
+              "errors"
+              "flag"
+              "io"
+              "log"
+              "net"
+              "net/url"
+              "os"
+              "os/signal"
+              "strings"
+              "sync"
+              "sync/atomic"
+              "syscall"
+              "time"
+
+              "github.com/gorilla/websocket"
+          )
+
+          const (
+              ver = 0x0111
+              opReqImport = 0x8003
+              opRepImport = 0x0003
+              opReqList = 0x8005
+              opRepList = 0x0005
+              cmdSubmit = 1
+              cmdUnlink = 2
+              retSubmit = 3
+              retUnlink = 4
+              fReq = 1
+              fResp = 2
+              maxTransfer = 8 * 1024 * 1024
+          )
+
+          var magic = []byte{'U','U','C','2'}
+
+          type Iface struct {
+              ID int `json:"id"`
+              AlternateSetting int `json:"alternateSetting"`
+              Class int `json:"class"`
+              Subclass int `json:"subclass"`
+              Protocol int `json:"protocol"`
+          }
+
+          type Device struct {
+              Type string `json:"type"`
+              BusID string `json:"busid"`
+              VendorID int `json:"vendorId"`
+              ProductID int `json:"productId"`
+              BCDDevice int `json:"bcdDevice"`
+              DeviceClass int `json:"deviceClass"`
+              DeviceSubclass int `json:"deviceSubclass"`
+              DeviceProtocol int `json:"deviceProtocol"`
+              ConfigValue int `json:"configValue"`
+              NumConfigurations int `json:"numConfigurations"`
+              Interfaces []Iface `json:"interfaces"`
+              Product string `json:"product"`
+          }
+
+          type response struct {
+              status int32
+              actual uint32
+              data []byte
+          }
+
+          type Bridge struct {
+              signal string
+              room string
+
+              wsMu sync.RWMutex
+              ws *websocket.Conn
+              writeMu sync.Mutex
+
+              devMu sync.RWMutex
+              dev *Device
+
+              pendMu sync.Mutex
+              pending map[uint64]chan response
+              id atomic.Uint64
+
+              stop chan struct{}
+          }
+
+          func NewBridge(signal, room string) *Bridge {
+              return &Bridge{
+                  signal: signal,
+                  room: room,
+                  pending: map[uint64]chan response{},
+                  stop: make(chan struct{}),
+              }
+          }
+
+          func (b *Bridge) endpoint() (string,error) {
+              u,e:=url.Parse(b.signal)
+              if e!=nil{return "",e}
+              q:=u.Query(); q.Set("room",b.room); q.Set("role","windows"); u.RawQuery=q.Encode()
+              return u.String(),nil
+          }
+
+          func (b *Bridge) Run() {
+              go func(){
+                  for {
+                      select { case <-b.stop:return; default: }
+                      if e:=b.runOnce(); e!=nil { log.Printf("relay: %v",e) }
+                      select { case <-b.stop:return; case <-time.After(2*time.Second): }
+                  }
+              }()
+          }
+
+          func (b *Bridge) runOnce() error {
+              ep,e:=b.endpoint(); if e!=nil{return e}
+              ws,_,e:=websocket.DefaultDialer.Dial(ep,nil); if e!=nil{return e}
+
+              b.wsMu.Lock(); b.ws=ws; b.wsMu.Unlock()
+              defer func(){ b.wsMu.Lock(); if b.ws==ws {b.ws=nil}; b.wsMu.Unlock(); ws.Close() }()
+
+              log.Printf("RELAY CONNECTED")
+              _=b.sendText(map[string]any{"type":"hello","role":"windows","protocol":2})
+
+              helloStop:=make(chan struct{})
+              defer close(helloStop)
+
+              go func(){
+                  ticker:=time.NewTicker(15*time.Second)
+                  defer ticker.Stop()
+
+                  for {
+                      select {
+                      case <-helloStop:
+                          return
+                      case <-ticker.C:
+                          _=b.sendText(map[string]any{
+                              "type":"hello",
+                              "role":"windows",
+                              "protocol":2,
+                          })
+                      }
+                  }
+              }()
+
+              for {
+                  kind,p,e:=ws.ReadMessage(); if e!=nil{return e}
+                  if kind==websocket.TextMessage { b.handleText(p) }
+                  if kind==websocket.BinaryMessage { b.handleBinary(p) }
+              }
+          }
+
+          func (b *Bridge) write(kind int,p []byte) error {
+              b.wsMu.RLock(); ws:=b.ws; b.wsMu.RUnlock()
+              if ws==nil{return errors.New("relay offline")}
+              b.writeMu.Lock(); defer b.writeMu.Unlock()
+              return ws.WriteMessage(kind,p)
+          }
+
+          func (b *Bridge) sendText(v any) error {
+              p,e:=json.Marshal(v); if e!=nil{return e}
+              return b.write(websocket.TextMessage,p)
+          }
+
+          func (b *Bridge) handleText(p []byte) {
+              var g map[string]any
+              if json.Unmarshal(p,&g)!=nil {return}
+              typ,_:=g["type"].(string)
+
+              if typ=="usb-device" {
+                  var d Device
+                  if json.Unmarshal(p,&d)!=nil{return}
+                  if d.BusID==""{d.BusID="1-1"}
+                  b.devMu.Lock(); b.dev=&d; b.devMu.Unlock()
+                  log.Printf("ANDROID USB READY %04x:%04x %q",d.VendorID,d.ProductID,d.Product)
+                  return
+              }
+
+              if typ=="usb-detach" {
+                  b.devMu.Lock(); b.dev=nil; b.devMu.Unlock()
+                  log.Printf("ANDROID USB DETACHED"); return
+              }
+
+              if typ=="hello" {
+                  if role,_:=g["role"].(string); role=="android" {
+                      log.Printf("ANDROID ONLINE")
+                      _=b.sendText(map[string]any{
+                          "type":"hello",
+                          "role":"windows",
+                          "protocol":2,
+                      })
+                  }
+                  return
+              }
+
+              if typ=="peer-joined" {
+                  if role,_:=g["role"].(string); role=="android" {
+                      log.Printf("ANDROID PEER JOINED")
+                      _=b.sendText(map[string]any{
+                          "type":"hello",
+                          "role":"windows",
+                          "protocol":2,
+                      })
+                  }
+                  return
+              }
+
+              log.Printf("relay text: %s",strings.TrimSpace(string(p)))
+          }
+
+          func (b *Bridge) handleBinary(p []byte) {
+              if len(p)<21 || !bytes.Equal(p[:4],magic) || p[4]!=fResp{return}
+              r:=bytes.NewReader(p[5:])
+              var id uint64; var st int32; var actual uint32
+              if binary.Read(r,binary.BigEndian,&id)!=nil{return}
+              if binary.Read(r,binary.BigEndian,&st)!=nil{return}
+              if binary.Read(r,binary.BigEndian,&actual)!=nil{return}
+              data,_:=io.ReadAll(r)
+              if uint32(len(data))>actual {data=data[:actual]}
+              b.pendMu.Lock(); ch:=b.pending[id]; delete(b.pending,id); b.pendMu.Unlock()
+              if ch!=nil {ch<-response{st,actual,data}}
+          }
+
+          func (b *Bridge) Device() *Device {
+              b.devMu.RLock(); defer b.devMu.RUnlock()
+              if b.dev==nil{return nil}
+              d:=*b.dev
+              d.Interfaces=append([]Iface(nil),b.dev.Interfaces...)
+              return &d
+          }
+
+          func (b *Bridge) Transfer(dir,ep uint8, setup [8]byte, payload []byte, n int) response {
+              if n<0||n>maxTransfer{return response{status:-90}}
+              id:=b.id.Add(1)
+              ch:=make(chan response,1)
+              b.pendMu.Lock(); b.pending[id]=ch; b.pendMu.Unlock()
+
+              buf:=new(bytes.Buffer)
+              buf.Write(magic); buf.WriteByte(fReq)
+              binary.Write(buf,binary.BigEndian,id)
+              buf.WriteByte(dir); buf.WriteByte(ep)
+              binary.Write(buf,binary.BigEndian,uint32(30000))
+              binary.Write(buf,binary.BigEndian,uint32(n))
+              buf.Write(setup[:])
+              if dir==0&&n>0 {
+                  if len(payload)<n {n=len(payload)}
+                  buf.Write(payload[:n])
+              }
+
+              if e:=b.write(websocket.BinaryMessage,buf.Bytes()); e!=nil {
+                  b.pendMu.Lock(); delete(b.pending,id); b.pendMu.Unlock()
+                  return response{status:-107}
+              }
+
+              select {
+              case r:=<-ch:return r
+              case <-time.After(35*time.Second):
+                  b.pendMu.Lock(); delete(b.pending,id); b.pendMu.Unlock()
+                  return response{status:-110}
+              }
+          }
+
+          func fixed(s string,n int) []byte {o:=make([]byte,n);copy(o,[]byte(s));return o}
+
+          func writeDev(w io.Writer,d *Device,ifs bool) error {
+              w.Write(fixed("/virtual/android-usb/1-1",256))
+              bus:=d.BusID;if bus==""{bus="1-1"};w.Write(fixed(bus,32))
+              for _,v:=range []any{uint32(1),uint32(1),uint32(3),uint16(d.VendorID),uint16(d.ProductID),uint16(d.BCDDevice)} {
+                  if e:=binary.Write(w,binary.BigEndian,v);e!=nil{return e}
+              }
+              w.Write([]byte{byte(d.DeviceClass),byte(d.DeviceSubclass),byte(d.DeviceProtocol),
+                  byte(d.ConfigValue),byte(d.NumConfigurations),byte(len(d.Interfaces))})
+              if ifs {
+                  for _,i:=range d.Interfaces {w.Write([]byte{byte(i.Class),byte(i.Subclass),byte(i.Protocol),0})}
+              }
+              return nil
+          }
+
+          func full(c net.Conn,n int)([]byte,error){p:=make([]byte,n);_,e:=io.ReadFull(c,p);return p,e}
+
+          type Server struct{b *Bridge}
+
+          func (s *Server) Serve(addr string) error {
+              ln,e:=net.Listen("tcp",addr);if e!=nil{return e}
+              log.Printf("USB/IP server %s",addr)
+              for {c,e:=ln.Accept();if e!=nil{return e};go s.conn(c)}
+          }
+
+          func (s *Server) conn(c net.Conn) {
+              defer c.Close()
+              c.SetDeadline(time.Now().Add(30*time.Second))
+              h,e:=full(c,8);if e!=nil{return}
+              op:=binary.BigEndian.Uint16(h[2:4])
+
+              if op==opReqList {s.list(c);return}
+
+              if op==opReqImport {
+                  p,e:=full(c,32);if e!=nil{return}
+                  bus:=strings.TrimRight(string(p),"\x00")
+                  s.importDev(c,bus);return
+              }
+          }
+
+          func (s *Server) list(c net.Conn) {
+              d:=s.b.Device();buf:=new(bytes.Buffer)
+              binary.Write(buf,binary.BigEndian,uint16(ver))
+              binary.Write(buf,binary.BigEndian,uint16(opRepList))
+              binary.Write(buf,binary.BigEndian,uint32(0))
+              if d==nil {binary.Write(buf,binary.BigEndian,uint32(0));c.Write(buf.Bytes());return}
+              binary.Write(buf,binary.BigEndian,uint32(1));writeDev(buf,d,true);c.Write(buf.Bytes())
+          }
+
+          func (s *Server) importDev(c net.Conn,bus string) {
+              d:=s.b.Device();buf:=new(bytes.Buffer)
+              binary.Write(buf,binary.BigEndian,uint16(ver))
+              binary.Write(buf,binary.BigEndian,uint16(opRepImport))
+              if d==nil||bus!=d.BusID {binary.Write(buf,binary.BigEndian,uint32(1));c.Write(buf.Bytes());return}
+              binary.Write(buf,binary.BigEndian,uint32(0));writeDev(buf,d,false)
+              if _,e:=c.Write(buf.Bytes());e!=nil{return}
+              c.SetDeadline(time.Time{})
+              log.Printf("USB/IP IMPORT %s",bus)
+              s.urbs(c)
+          }
+
+          func (s *Server) urbs(c net.Conn) {
+              var wm sync.Mutex
+              var cm sync.Mutex
+              cancelled:=map[uint32]bool{}
+
+              for {
+                  h,e:=full(c,48);if e!=nil{return}
+                  cmd:=binary.BigEndian.Uint32(h[0:4])
+                  seq:=binary.BigEndian.Uint32(h[4:8])
+                  dir:=binary.BigEndian.Uint32(h[12:16])
+                  ep:=binary.BigEndian.Uint32(h[16:20])
+
+                  if cmd==cmdSubmit {
+                      n:=int(int32(binary.BigEndian.Uint32(h[24:28])))
+                      packets:=int32(binary.BigEndian.Uint32(h[32:36]))
+                      var setup [8]byte;copy(setup[:],h[40:48])
+
+                      if n<0||n>maxTransfer {go retSub(c,&wm,seq,-90,0,nil);continue}
+
+                      var payload []byte
+                      if dir==0&&n>0 {payload,e=full(c,n);if e!=nil{return}}
+
+                      if packets>0 {
+                          if _,e=full(c,int(packets)*16);e!=nil{return}
+                          go retSub(c,&wm,seq,-95,0,nil);continue
+                      }
+
+                      go func(seq,dir,ep uint32,setup [8]byte,payload []byte,n int){
+                          r:=s.b.Transfer(uint8(dir),uint8(ep),setup,payload,n)
+                          cm.Lock(); x:=cancelled[seq];delete(cancelled,seq);cm.Unlock()
+                          if x{return}
+                          data:=r.data;if dir==0{data=nil}
+                          retSub(c,&wm,seq,r.status,r.actual,data)
+                      }(seq,dir,ep,setup,payload,n)
+                      continue
+                  }
+
+                  if cmd==cmdUnlink {
+                      target:=binary.BigEndian.Uint32(h[20:24])
+                      cm.Lock();cancelled[target]=true;cm.Unlock()
+                      retUnlinkFn(c,&wm,seq,-104)
+                      continue
+                  }
+
+                  return
+              }
+          }
+
+          func retSub(c net.Conn,m *sync.Mutex,seq uint32,st int32,actual uint32,data []byte) {
+              b:=new(bytes.Buffer)
+              for _,v:=range []any{uint32(retSubmit),seq,uint32(0),uint32(0),uint32(0),st,actual,
+                  uint32(0),uint32(0xffffffff),uint32(0),uint64(0)} {binary.Write(b,binary.BigEndian,v)}
+              if data!=nil{b.Write(data)}
+              m.Lock();defer m.Unlock();c.Write(b.Bytes())
+          }
+
+          func retUnlinkFn(c net.Conn,m *sync.Mutex,seq uint32,st int32) {
+              b:=new(bytes.Buffer)
+              for _,v:=range []any{uint32(retUnlink),seq,uint32(0),uint32(0),uint32(0),st} {
+                  binary.Write(b,binary.BigEndian,v)
+              }
+              b.Write(make([]byte,24))
+              m.Lock();defer m.Unlock();c.Write(b.Bytes())
+          }
+
+          func main() {
+              signalURL:=flag.String("signal","","relay URL")
+              room:=flag.String("room","","room")
+              flag.Parse()
+              if *signalURL==""||len(*room)<12{flag.Usage();os.Exit(2)}
+
+              b:=NewBridge(*signalURL,*room);b.Run()
+              s:=&Server{b:b}
+              go func(){if e:=s.Serve("127.0.0.1:3240");e!=nil{log.Fatal(e)}}()
+
+              log.Printf("FULL RELAY AGENT READY")
+              stop:=make(chan os.Signal,1)
+              signal.Notify(stop,syscall.SIGINT,syscall.SIGTERM)
+              <-stop
+              close(b.stop)
+          }
+          '@ | Set-Content "$r\main.go" -Encoding utf8
+
+          Push-Location $r
+          go mod tidy
+          go build -trimpath -ldflags="-s -w" -o uuc-agent.exe .
+          Pop-Location
+
+          $exe = Join-Path $r "uuc-agent.exe"
+          if (-not (Test-Path $exe)) { throw "Agent build gagal" }
+          "AGENT_EXE=$exe" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          Write-Host "Windows FULL agent: OK"
+
+      - name: Run FULL USB bridge
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:ROOM) -or $env:ROOM.Length -lt 12) {
+            throw "room_code minimal 12 karakter"
+          }
+
+          $out = Join-Path $env:RUNNER_TEMP "uuc.out.log"
+          $err = Join-Path $env:RUNNER_TEMP "uuc.err.log"
+
+          $args = @("-signal",$env:SIGNAL_URL,"-room",$env:ROOM)
+
+          $proc = Start-Process `
+            -FilePath $env:AGENT_EXE `
+            -ArgumentList $args `
+            -RedirectStandardOutput $out `
+            -RedirectStandardError $err `
+            -PassThru
+
+          Start-Sleep 3
+          if ($proc.HasExited) {
+            Get-Content $out -ErrorAction SilentlyContinue
+            Get-Content $err -ErrorAction SilentlyContinue
+            throw "Agent langsung mati"
+          }
+
+          Write-Host "========================================"
+          Write-Host " FULL CLOUD USB READY"
+          Write-Host " Room sama dengan APK"
+          Write-Host " APK -> CONNECT CLOUD"
+          Write-Host " APK -> CONNECT SELECTED USB"
+          Write-Host "========================================"
+
+          $attached = $false
+          $end = (Get-Date).AddMinutes([int]$env:KEEP)
+
+          while ((Get-Date) -lt $end) {
+            if ($proc.HasExited) {
+              Get-Content $out -Tail 300 -ErrorAction SilentlyContinue
+              Get-Content $err -Tail 300 -ErrorAction SilentlyContinue
+              throw "Agent berhenti"
+            }
+
+            Write-Host "`n=== $(Get-Date -Format o) ==="
+            Get-Content $out -Tail 100 -ErrorAction SilentlyContinue
+            Get-Content $err -Tail 100 -ErrorAction SilentlyContinue
+
+            if (-not $attached) {
+              $l = (& "$env:USBIP_EXE" list -r 127.0.0.1 2>&1 | Out-String)
+              Write-Host $l
+
+              # usbip-win2 formats DEVLIST with variable whitespace:
+              # "1-1    : vendor : product (...)"
+              # Parse the busid instead of requiring literal "1-1:".
+              $busMatches = [regex]::Matches(
+                $l,
+                '(?m)^\s*([0-9]+-[0-9]+(?:\.[0-9]+)*)\s*:'
+              )
+
+              $busIds = @(
+                $busMatches |
+                  ForEach-Object { $_.Groups[1].Value } |
+                  Select-Object -Unique
+              )
+
+              foreach ($busId in $busIds) {
+                Write-Host "USB Android terdeteksi -> attach busid $busId"
+
+                $a = (
+                  & "$env:USBIP_EXE" attach `
+                    -r 127.0.0.1 `
+                    -b $busId `
+                    2>&1 |
+                  Out-String
+                )
+                $attachExit = $LASTEXITCODE
+
+                Write-Host $a
+                Write-Host "usbip attach exit code: $attachExit"
+
+                if ($attachExit -eq 0 -or
+                    $a -match '(?i)successfully attached|attached successfully') {
+
+                  Start-Sleep 3
+
+                  $attached = $true
+                  Write-Host "========================================"
+                  Write-Host " USB ATTACHED TO WINDOWS"
+                  Write-Host " BusID: $busId"
+                  Write-Host "========================================"
+
+                  Write-Host "`n--- PnP immediately after attach ---"
+                  Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+                    Where-Object {
+                      $_.Class -match "USB|DiskDrive|Ports|AndroidUsbDeviceClass"
+                    } |
+                    Select-Object Status,Class,FriendlyName,InstanceId |
+                    Format-Table -AutoSize
+
+                  break
+                }
+                else {
+                  Write-Warning "Attach busid $busId gagal; akan dicoba lagi pada loop berikutnya."
+                }
+              }
+            }
+
+            Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+              Where-Object { $_.Class -match "USB|DiskDrive|Ports|AndroidUsbDeviceClass" } |
+              Select-Object Status,Class,FriendlyName |
+              Format-Table -AutoSize
+
+            Start-Sleep 10
+          }
+
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
